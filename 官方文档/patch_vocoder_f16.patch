@@ -1,0 +1,97 @@
+commit 34a0239235873cef2fb33275e27116112e36c5f2
+Author: omni-bench <omni-bench@local>
+Date:   Wed Aug 19 15:45:41 2026 +0000
+
+    token2wav: hifigan conv F16 option (OMNI_T2W_F16_CONV=1, vocoder -24%)
+    
+    hifigan（mel→wav）的 3 个 conv 站点（f0_predictor / hift conv1d / resblock conv1d）
+    是 F32 im2col+mul_mat 真 F32 计算。加 env 门控的 F16 变体（输入/权重 cast F16 →
+    im2col F16 → mul_mat F16 → 结果 cast 回 F32），默认关闭，OMNI_T2W_F16_CONV=1 启用。
+    
+    实测（50 条 Seed-TTS 中文集）：
+    - vocoder 119.9→90.9ms（-24%）；token2wav 阶段 ~0.21→0.177（-17%）
+    - 50 条 wav 与 F32 逐字节 100% 相同（0 差异）；WER 1.233%=1.233%、SIM 0.716=0.716
+    - 输出逐字节相同的机制待查（推测 CANN 对 F16 张量内部按 F32 精度计算，仅内存减半）
+    
+    Signed-off-by: omni-bench <omni-bench@local>
+
+diff --git a/tools/omni/token2wav/token2wav-impl.cpp b/tools/omni/token2wav/token2wav-impl.cpp
+index f6ae610..9f891a7 100644
+--- a/tools/omni/token2wav/token2wav-impl.cpp
++++ b/tools/omni/token2wav/token2wav-impl.cpp
+@@ -4971,12 +4971,22 @@ static ggml_tensor * hg_f0_predictor_conv1d_k3_p1_f32(ggml_context * ctx,
+                      (long long) Cout, (long long) b_oc->ne[0]);
+         return nullptr;
+     }
+-    ggml_tensor * im2col = ggml_im2col(ctx, w_kic_oc, x_tcb, 1, 0, 1, 0, 1, 0, false, GGML_TYPE_F32);
++    // 🔧 [实验] hifigan conv F16 化（OMNI_T2W_F16_CONV=1；数值不同需 WER/SIM 验证）
++    static const bool f16_conv = []() {
++        const char * s = std::getenv("OMNI_T2W_F16_CONV");
++        return s != nullptr && std::string(s) != "0" && std::string(s) != "off";
++    }();
++    ggml_tensor * x_in = f16_conv ? ggml_cast(ctx, x_tcb, GGML_TYPE_F16) : x_tcb;
++    ggml_tensor * w_in = f16_conv ? ggml_cast(ctx, w_kic_oc, GGML_TYPE_F16) : w_kic_oc;
++    ggml_tensor * im2col = ggml_im2col(ctx, w_in, x_in, 1, 0, 1, 0, 1, 0, false, f16_conv ? GGML_TYPE_F16 : GGML_TYPE_F32);
+     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
+     im2col_2d               = ggml_cont(ctx, im2col_2d);
+-    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
++    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_in, K * Cin, Cout);
+     w_2d               = ggml_cont(ctx, w_2d);
+     ggml_tensor * mm = ggml_mul_mat(ctx, im2col_2d, w_2d);
++    if (f16_conv) {
++        mm = ggml_cast(ctx, mm, GGML_TYPE_F32);
++    }
+     ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, T, Cout, B);
+     y_tcb               = ggml_cont(ctx, y_tcb);
+     ggml_tensor * b_1c1  = ggml_reshape_3d(ctx, b_oc, 1, Cout, 1);
+@@ -5253,12 +5263,22 @@ static ggml_tensor * hg_hift_conv1d_f32(ggml_context * ctx,
+                      (long long) b_oc->ne[0]);
+         return nullptr;
+     }
+-    ggml_tensor * im2col = ggml_im2col(ctx, w_kic_oc, x_tcb, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
++    // 🔧 [实验] hifigan conv F16 化（OMNI_T2W_F16_CONV=1；数值不同需 WER/SIM 验证）
++    static const bool f16_conv = []() {
++        const char * s = std::getenv("OMNI_T2W_F16_CONV");
++        return s != nullptr && std::string(s) != "0" && std::string(s) != "off";
++    }();
++    ggml_tensor * x_in = f16_conv ? ggml_cast(ctx, x_tcb, GGML_TYPE_F16) : x_tcb;
++    ggml_tensor * w_in = f16_conv ? ggml_cast(ctx, w_kic_oc, GGML_TYPE_F16) : w_kic_oc;
++    ggml_tensor * im2col = ggml_im2col(ctx, w_in, x_in, stride, 0, padding, 0, dilation, 0, false, f16_conv ? GGML_TYPE_F16 : GGML_TYPE_F32);
+     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
+     im2col_2d               = ggml_cont(ctx, im2col_2d);
+-    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
++    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_in, K * Cin, Cout);
+     w_2d               = ggml_cont(ctx, w_2d);
+     ggml_tensor * mm    = ggml_mul_mat(ctx, im2col_2d, w_2d);
++    if (f16_conv) {
++        mm = ggml_cast(ctx, mm, GGML_TYPE_F32);
++    }
+     ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, im2col->ne[1], Cout, B);
+     y_tcb               = ggml_cont(ctx, y_tcb);
+     ggml_tensor * b_1c1 = ggml_reshape_3d(ctx, b_oc, 1, Cout, 1);
+@@ -5989,13 +6009,23 @@ static ggml_tensor * hg_resblock_conv1d_f32(ggml_context *
+                      c.kernel_size, (long long) K);
+         return nullptr;
+     }
++    // 🔧 [实验] hifigan conv F16 化（OMNI_T2W_F16_CONV=1；数值不同需 WER/SIM 验证）
++    static const bool f16_conv = []() {
++        const char * s = std::getenv("OMNI_T2W_F16_CONV");
++        return s != nullptr && std::string(s) != "0" && std::string(s) != "off";
++    }();
++    ggml_tensor * x_in = f16_conv ? ggml_cast(ctx, x_tcb, GGML_TYPE_F16) : x_tcb;
++    ggml_tensor * w_in = f16_conv ? ggml_cast(ctx, c.weight_kic_oc, GGML_TYPE_F16) : c.weight_kic_oc;
+     ggml_tensor * im2col =
+-        ggml_im2col(ctx, c.weight_kic_oc, x_tcb, 1, 0, c.padding, 0, c.dilation, 0, false, GGML_TYPE_F32);
++        ggml_im2col(ctx, w_in, x_in, 1, 0, c.padding, 0, c.dilation, 0, false, f16_conv ? GGML_TYPE_F16 : GGML_TYPE_F32);
+     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
+     im2col_2d               = ggml_cont(ctx, im2col_2d);
+-    ggml_tensor * w_2d = ggml_reshape_2d(ctx, c.weight_kic_oc, K * Cin, Cout);
++    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_in, K * Cin, Cout);
+     w_2d               = ggml_cont(ctx, w_2d);
+     ggml_tensor * mm    = ggml_mul_mat(ctx, im2col_2d, w_2d);
++    if (f16_conv) {
++        mm = ggml_cast(ctx, mm, GGML_TYPE_F32);
++    }
+     ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, T, Cout, B);
+     y_tcb               = ggml_cont(ctx, y_tcb);
+     ggml_tensor * b_1c1 = ggml_reshape_3d(ctx, c.bias_oc, 1, Cout, 1);

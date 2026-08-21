@@ -27,8 +27,14 @@
 │   ├── sprint16-rtf-remeasure-finding.md
 │   ├── flow-B1尝试.md         ← flow B=1（token2wav 减半，因精度评测崩溃否决）
 │   └── ...
+├── 官方文档/                 ← 官方评测说明、提交规范、补丁（2026-08-20 版）
+│   ├── official_eval_method_20260820.md   ← 官方最新评测方法分析（RTF 口径/有效性检查/提交规范）
+│   ├── official_eval.patch                ← 官方提交规范（SUBMISSION_GUIDE.md）
+│   ├── official_infer.patch               ← 官方推理相关补丁
+│   └── patch_*.patch                      ← 各优化补丁（normalize/resize/vocoder/vpm_batch）
 └── 历史归档/
-    └── 总体进度与决策.md       ← 跨 Sprint 的完整进度、技术坑、决策记录
+    ├── 总体进度与决策.md       ← 跨 Sprint 的完整进度、技术坑、决策记录
+    └── 原始文档/              ← 服务器原始实验文档（change_review/headcode_correctness/tts_fa_graph_diff 等）
 ```
 
 ## 约定

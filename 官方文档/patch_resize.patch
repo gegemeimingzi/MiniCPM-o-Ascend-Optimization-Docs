@@ -1,0 +1,128 @@
+commit 8a32225be53e30fc0436241a63f3eb9ad3c439dd
+Author: omni-bench <omni-bench@local>
+Date:   Wed Aug 19 05:34:02 2026 +0000
+
+    vision: parallelize bicubic resize with OpenMP (preprocess -80%)
+    
+    duplex 每帧预处理（overview+slice 两次 bicubic resize 336x602）原为纯 CPU 标量
+    逐像素循环 ~34ms/帧，占 encode 墙钟 25%。bicubic 逐像素独立，OpenMP 并行化后
+    ~7ms/帧（数学逐像素不变，零质量影响）。omni 目标补 OpenMP 链接（GGML_OPENMP 时）。
+    
+    实测（10-chunk 两轮）：
+    - 预处理 34ms → 7ms（-80%）
+    - image-encoded 137 → 110ms（-20%）
+    - encode 阶段 0.145 → ~0.120（-17%）
+    - RTF 0.700 → ~0.688（encode 贡献 -0.025 确定，其余含 tts 方差）
+    
+    Signed-off-by: omni-bench <omni-bench@local>
+
+diff --git a/tools/omni/CMakeLists.txt b/tools/omni/CMakeLists.txt
+index 1d2c41f..633acd8 100644
+--- a/tools/omni/CMakeLists.txt
++++ b/tools/omni/CMakeLists.txt
+@@ -47,6 +47,13 @@ endif()
+ 
+ target_link_libraries     (omni PUBLIC ggml llama llama-common)
+ target_link_libraries     (omni PRIVATE Threads::Threads)
++if (GGML_OPENMP)
++    find_package(OpenMP)
++    if (OpenMP_CXX_FOUND)
++        target_link_libraries(omni PRIVATE OpenMP::OpenMP_CXX)
++        message(STATUS "omni: OpenMP enabled (vision bicubic resize parallel)")
++    endif()
++endif()
+ target_include_directories(omni PUBLIC  .)
+ target_include_directories(omni PRIVATE ../..)
+ target_include_directories(omni PRIVATE ../../vendor)
+diff --git a/tools/omni/vision.cpp b/tools/omni/vision.cpp
+index 9c727b0..3bdff84 100644
+--- a/tools/omni/vision.cpp
++++ b/tools/omni/vision.cpp
+@@ -1713,31 +1713,29 @@ struct image_manipulation {
+         dst.ny = target_height;
+         dst.buf.resize(3 * target_width * target_height);
+ 
+-        float Cc;
+-        float C[5] = {};
+-        float d0, d2, d3, a0, a1, a2, a3;
+-        int i, j, k, jj;
+-        int x, y;
+-        float dx, dy;
+-        float tx, ty;
+-
+-        tx = (float)nx / (float)target_width;
+-        ty = (float)ny / (float)target_height;
++        const float tx = (float)nx / (float)target_width;
++        const float ty = (float)ny / (float)target_height;
+ 
+         // Bicubic interpolation; adapted from ViT.cpp, inspired from :
+         //    -> https://github.com/yglukhov/bicubic-interpolation-image-processing/blob/master/libimage.c#L36
+         //    -> https://en.wikipedia.org/wiki/Bicubic_interpolation
+-
+-        for (i = 0; i < target_height; i++) {
+-            for (j = 0; j < target_width; j++) {
+-                x = (int)(tx * j);
+-                y = (int)(ty * i);
+-
+-                dx = tx * j - x;
+-                dy = ty * i - y;
+-
+-                for (k = 0; k < 3; k++) {
+-                    for (jj = 0; jj <= 3; jj++) {
++        // 🔧 [并行] 逐像素独立，OpenMP 并行化（数学逐像素不变，零质量影响）。
++        // duplex 每帧两次 resize（overview+slice）各 ~17ms → 并行后 ~2-3ms。
++#ifdef _OPENMP
++        #pragma omp parallel for schedule(static)
++#endif
++        for (int i = 0; i < target_height; i++) {
++            float C[5] = {};
++            float d0, d2, d3, a0, a1, a2, a3, Cc;
++            for (int j = 0; j < target_width; j++) {
++                const int x = (int)(tx * j);
++                const int y = (int)(ty * i);
++
++                const float dx = tx * j - x;
++                const float dy = ty * i - y;
++
++                for (int k = 0; k < 3; k++) {
++                    for (int jj = 0; jj <= 3; jj++) {
+                         d0 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x - 1, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
+                         d2 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x + 1, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
+                         d3 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x + 2, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
+
+commit ad880be4ade14bc421f1f0adfb6dcd4afdf5fb20
+Author: omni-bench <omni-bench@local>
+Date:   Wed Aug 19 10:58:43 2026 +0000
+
+    vision: cap bicubic resize OpenMP threads at 64 (preprocess 6.5→4.9ms)
+    
+    336 行的带宽受限任务，OpenMP 默认 640 线程过订阅（实测 preprocess 6.47ms）；
+    num_threads(min(64, max)) 限制后 4.89ms（-24%），小机器自动降级。
+    encode 阶段 0.119 → 0.116-0.118（-2%），image-encoded 110.2 → 107.3ms。
+    
+    Signed-off-by: omni-bench <omni-bench@local>
+
+diff --git a/tools/omni/vision.cpp b/tools/omni/vision.cpp
+index 3bdff84..e0d5580 100644
+--- a/tools/omni/vision.cpp
++++ b/tools/omni/vision.cpp
+@@ -1,5 +1,8 @@
+ #include "omni-impl.h"
+ #include "vision.h"
++#ifdef _OPENMP
++#include <omp.h>
++#endif
+ 
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+@@ -1722,7 +1725,9 @@ struct image_manipulation {
+         // 🔧 [并行] 逐像素独立，OpenMP 并行化（数学逐像素不变，零质量影响）。
+         // duplex 每帧两次 resize（overview+slice）各 ~17ms → 并行后 ~2-3ms。
+ #ifdef _OPENMP
+-        #pragma omp parallel for schedule(static)
++        // 336 行的带宽受限任务，64 线程最优（实测 4.9ms vs 默认 640 线程 6.5ms）；
++        // min(64, max) 在小机器上自动降级
++        #pragma omp parallel for schedule(static) num_threads(omp_get_max_threads() < 64 ? omp_get_max_threads() : 64)
+ #endif
+         for (int i = 0; i < target_height; i++) {
+             float C[5] = {};
